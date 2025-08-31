@@ -106,12 +106,14 @@ const int CHAR_W = 12; // font size 2
 const int CHAR_H = 16;
 const int VPAD   = 2;
 
+// ---- types must be defined BEFORE functions that use them ----
 struct BtnState { uint8_t pin; bool pressed; const char* name; };
 struct BoxPx   { int x; int y; };
 
 // ---- layout boxes ----
 BoxPx   gBoxTL, gBoxTR, gBoxBL, gBoxBR;
 
+// ---- buttons ----
 BtnState buttons[5] = {
   { (uint8_t)BTN_UP,    false, "UP"    },
   { (uint8_t)BTN_DOWN,  false, "DOWN"  },
@@ -350,7 +352,7 @@ static void drawFooterOnceThenMaintain(){ if(!footerInitDone) drawFooterInit(); 
 // ===== Buttons =====
 static void setupButtons(){ pinMode(BTN_UP,INPUT); pinMode(BTN_DOWN,INPUT); pinMode(BTN_LEFT,INPUT); pinMode(BTN_RIGHT,INPUT); pinMode(BTN_OK,INPUT); }
 static void adjustBrightness(int d){ int v=(int)gBrightness+d; v=constrain(v,0,255); if(v!=gBrightness){ gBrightness=(uint8_t)v; blSet(gBrightness); drawFooterBLIfChanged(); } }
-static void updateButton(BtnState &b, uint8_t i){
+static void updateButton(uint8_t i){ BtnState &b = buttons[i];
   bool raw=(digitalRead(b.pin)==LOW); uint32_t now=millis();
   if(raw!=b.pressed && (now-lastChange[i])>DEBOUNCE_MS){
     b.pressed=raw; lastChange[i]=now;
@@ -435,7 +437,7 @@ void setup() {
 void loop() {
   BoardTemp_poll_1Hz();
 
-  for (uint8_t i = 0; i < 5; ++i) updateButton(buttons[i], i);
+  for (uint8_t i = 0; i < 5; ++i) updateButton(i);
 
   if (gRebootM4Requested) { gRebootM4Requested = false; bootM4(); waitForM4Ready(3000); }
   if (gSpinM4Requested)   {
@@ -462,7 +464,7 @@ void loop() {
     String s = RPC.readStringUntil('\n'); s.trim();
     if (s.startsWith("M4,")) {
       int c1 = s.indexOf(','), c2 = s.indexOf(',', c1+1);
-      if (c1 > 0 && c2 > c1) {
+      if (c1 > 0 and c2 > c1) {
         gM4LoadPct = constrain(s.substring(c1+1,c2).toInt(), 0, 100);
         gM4MHz     = s.substring(c2+1).toInt();
         gM4LastMs  = millis();
@@ -509,3 +511,4 @@ void loop() {
 
   delay(1); // keep idle thread running for accurate load%
 }
+
