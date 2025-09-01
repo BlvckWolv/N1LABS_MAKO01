@@ -4,8 +4,8 @@
    - 5s splash ("N1LABS" + ASCII loading bar, flicker-free)
    - Temp in °C from MAX17262 fuel-gauge (I2C 0x36, Wire1)
    - M7/M4 load via RPC (robust parser)
-   - RIGHT tap = stress M4 (SPIN or TESTLOAD)
-   - Footer: left "N1LABS" chip, right 8‑bit brightness icon (reflects 0..255 BL)
+   - RIGHT tap = stress M4 (short real-time burst)
+   - Footer: left "N1LABS" chip, right static 8‑bit brightness icon + percent
 */
 
 #include <Arduino.h>
@@ -18,6 +18,9 @@
 #include <time.h>
 #include <RPC.h>
 #include <Wire.h>
+
+// Boot helper provided in your environment
+void bootM4(void);
 
 // ---------------- BoardTemp (MAX17262) inline ----------------
 namespace BoardTempInline {
@@ -264,10 +267,8 @@ static void drawClockChips(bool force){
   gfx->setTextColor(COL_CLK_TXT, COL_DATE_BG); gfx->setCursor(x2+padX, CLK_Y); gfx->print(dbuf);
 }
 
-// ===== Pixel-art brightness icon (8-bit style) =====
-// Draws a 5x5 pixel "sun" core with up to 8 rays, scaled by 's'.
-// 'level' is 0..255 (maps to 0..8 rays). Drawn with foreground color 'fg' on background 'bg'.
-static void drawBrightnessIcon8(int x, int y, uint16_t fg, uint16_t bg, uint8_t level, int s){
+// ===== Pixel-art brightness icon (static) =====
+static void drawBrightnessIcon8(int x, int y, uint16_t fg, uint16_t bg, uint8_t /*level*/, int s){
   // Clear a safe bounding box (~(5+2)*s square)
   int bw = (5+2)*s, bh = (5+2)*s;
   gfx->fillRect(x, y, bw, bh, COL_BG);
@@ -278,17 +279,41 @@ static void drawBrightnessIcon8(int x, int y, uint16_t fg, uint16_t bg, uint8_t 
       gfx->fillRect(x + (dx*s), y + (dy*s), s, s, fg);
     }
   }
-
-  // Map level (0..255) to 0..8 rays
-  int rays = (int)((level * 8 + 127) / 255); // rounded
-  if (rays < 0) rays = 0; if (rays > 8) rays = 8;
-
-  // Ray order: N, E, S, W, NE, SE, SW, NW
+  // Always show all 8 rays (static icon)
   const int RX[8] = {2,4,2,0,4,4,0,0};
   const int RY[8] = {0,2,4,2,0,4,4,0};
-
-  for (int i=0; i<rays; ++i){
+  for (int i=0; i<8; ++i){
     gfx->fillRect(x + RX[i]*s, y + RY[i]*s, s, s, fg);
+  }
+}
+
+// Stretch to exact square (size x size) so icon width == height (matches chip visually)
+static void drawBrightnessIcon8_fitSquare(int x, int y, uint16_t fg, uint16_t bg, uint8_t /*level*/, int size){
+  if (size < 7) { drawBrightnessIcon8(x, y, fg, bg, 0, 1); return; }
+  int base = size / 7;
+  int rem  = size - base*7;          // 0..6
+  int rowH[7], colW[7], rowY[7], colX[7];
+  for (int i=0;i<7;i++){ rowH[i]=base + (i<rem?1:0); colW[i]=base + (i<rem?1:0); }
+  rowY[0]=0; colX[0]=0;
+  for (int i=1;i<7;i++){ rowY[i]=rowY[i-1]+rowH[i-1]; colX[i]=colX[i-1]+colW[i-1]; }
+  gfx->fillRect(x, y, size, size, bg);
+  auto g5to7 = [](int v){ return v+1; }; // center 5x5 inside 7x7
+
+  // core 3x3
+  for (int dy=1; dy<=3; ++dy){
+    int ry = g5to7(dy);
+    for (int dx=1; dx<=3; ++dx){
+      int rx = g5to7(dx);
+      gfx->fillRect(x + colX[rx], y + rowY[ry], colW[rx], rowH[ry], fg);
+    }
+  }
+  // rays
+  const int RX[8] = {2,4,2,0,4,4,0,0};
+  const int RY[8] = {0,2,4,2,0,4,4,0};
+  for (int i=0;i<8;i++){
+    int rx = g5to7(RX[i]);
+    int ry = g5to7(RY[i]);
+    gfx->fillRect(x + colX[rx], y + rowY[ry], colW[rx], rowH[ry], fg);
   }
 }
 
@@ -298,28 +323,65 @@ static void drawFooterInit(){
   const int y = 170 - CHAR_H - 2;
   gfx->fillRect(0, y, 320, CHAR_H+2, COL_BG);
   const char *LOGO="N1LABS"; int textW=(int)strlen(LOGO)*CHAR_W; int padX=5,padY=1;
-  int chipW=textW+padX*2, chipH=CHAR_H+padY*2-2, chipX=8, chipY=y-1, radius=2;
+  int chipW=textW+padX*2, chipH=CHAR_H+padY*2-1, chipX=8, chipY=y-1, radius=2; // bottom +1 px
   gfx->fillRoundRect(chipX, chipY, chipW, chipH, radius, COL_CHIP);
   gfx->setTextColor(COL_CHIPFG, COL_CHIP); gfx->setTextSize(2); gfx->setCursor(chipX+padX, y); gfx->print(LOGO);
   footerInitDone=true; lastBLpct=-1;
 }
+
 static void drawFooterBLIfChanged(){
   const int y = 170 - CHAR_H - 2;
   int pct = (int)gBrightness * 100 / 255;
-  if(pct == lastBLpct && footerInitDone) return;
-  lastBLpct = pct;
 
-  // Place icon at far right with small padding
-  int s = 2;                 // pixel scale
-  int iconW = (5+2)*s;       // as used in drawBrightnessIcon8
-  int iconH = (5+2)*s;
-  int pad = 6;
-  int x = 320 - pad - iconW;
-  int iy = y + (CHAR_H - iconH)/2; if (iy < y) iy = y;
+  // Layout constants
+  const int chipPadY = 1;
+  const int chipH = CHAR_H + chipPadY*2 - 1;
+  const int chipTop = y - 1;
+  const int cw2 = 12;                 // font width at size=2
+  const int padEdge = 6;
 
-  // Draw pixel-art sun icon; level uses raw 0..255 brightness
-  drawBrightnessIcon8(x, iy, COL_TEXT, COL_BG, gBrightness, s);
+  // Cache icon geometry and draw only once so it never "animates"
+  static bool iconDrawn = false;
+  static int iconSize = 0;
+  static int iconX = 0, iconY = 0;
+  static int txtX = 0, txtY = 0;
+  static int txtMaxW = 0;
+
+  if (!iconDrawn){
+    iconSize = chipH;                 // square equal to chip height
+    const char *maxTxt = ":100%";     // tight, no spaces
+    txtMaxW = (int)strlen(maxTxt) * cw2;
+
+    const int groupW = iconSize + txtMaxW;   // no gap (we'll overlap text by 2px)
+    const int groupX = 320 - padEdge - groupW;
+
+    iconX = groupX;
+    iconY = chipTop;
+    drawBrightnessIcon8_fitSquare(iconX, iconY, COL_TEXT, COL_BG, 0 /*ignored*/, iconSize);
+
+    // 2px tighter: place text 2 pixels into the icon's bbox
+    txtX = iconX + iconSize - 2;
+    txtY = y;
+
+    iconDrawn = true;
+  }
+
+  // Only update the percent text if changed; do NOT erase/redraw the icon
+  static int lastPct = -1;
+  if (pct == lastPct && footerInitDone) return;
+  lastPct = pct;
+
+  // Clear just the text box area
+  gfx->fillRect(txtX, txtY-1, txtMaxW+2, CHAR_H+2, COL_BG);
+
+  // Render ":NN%"
+  char txt[16]; snprintf(txt, sizeof(txt), ":%d%%", pct);
+  gfx->setTextColor(COL_TEXT, COL_BG);
+  gfx->setTextSize(2);
+  gfx->setCursor(txtX, txtY);
+  gfx->print(txt);
 }
+
 static void drawFooterOnceThenMaintain(){ if(!footerInitDone) drawFooterInit(); drawFooterBLIfChanged(); }
 
 // ===== Buttons =====
@@ -400,7 +462,7 @@ static void showSplash5s(){
   for (int i=0;i<barChars;i++) gfx->print(' ');
   gfx->print(']');
 
-  // Fixed-width status text (no flicker): always print same-length string at same x
+  // Fixed-width status text (no flicker)
   const char *msgTemplate = "Initializing... 100%";
   int msg_w = (int)strlen(msgTemplate) * cw2;
   int msg_x = (320 - msg_w)/2;
@@ -415,7 +477,6 @@ static void showSplash5s(){
     int filled = (int)floorf(frac * barChars + 0.5f);
     int pct    = (int)roundf(frac * 100.0f);
 
-    // Only draw newly filled segments (no full clears)
     if (filled > last_filled){
       for (int i = last_filled; i < filled; ++i){
         gfx->setCursor(x + cw2*(1 + i), y);
@@ -424,19 +485,16 @@ static void showSplash5s(){
       last_filled = filled;
     }
 
-    // Print fixed-width message; background color overwrites previous without clearing
     if (pct != last_pct){
       char msg[32];
-      snprintf(msg, sizeof(msg), "Initializing... %3d%%", pct); // fixed width
+      snprintf(msg, sizeof(msg), "Initializing... %3d%%", pct);
       gfx->setCursor(msg_x, msg_y);
       gfx->print(msg);
       last_pct = pct;
     }
-
     delay(30);
   }
 
-  // Ensure complete
   for (int i = last_filled; i < barChars; ++i){
     gfx->setCursor(x + cw2*(1 + i), y);
     gfx->print('=');
@@ -486,11 +544,23 @@ void loop() {
   if (gRebootM4Requested) { gRebootM4Requested = false; bootM4(); }
   if (gSpinM4Requested)   {
     gSpinM4Requested = false;
-    RPC.println("SPIN,1200");     // newer M4
-    RPC.println("TESTLOAD,1");    // older M4 fallback
-    gSpinStopAtMs = millis() + 1500;
+    // Start a short ~real-time burst
+    const uint32_t SPIN_BURST_MS = 1200;
+    gSpinStopAtMs = millis() + SPIN_BURST_MS;
   }
-  if (gSpinStopAtMs && millis() > gSpinStopAtMs) { RPC.println("TESTLOAD,0"); gSpinStopAtMs = 0; }
+  static uint32_t lastSpinTxMs = 0;
+  const uint32_t SPIN_CMD_PERIOD_MS = 100;  // faster resend for snappier response
+  if (gSpinStopAtMs){
+    if (millis() - lastSpinTxMs >= SPIN_CMD_PERIOD_MS){
+      RPC.println("SPIN,1200");     // newer M4
+      RPC.println("TESTLOAD,1");    // older M4 fallback
+      lastSpinTxMs = millis();
+    }
+    if (millis() >= gSpinStopAtMs){
+      RPC.println("TESTLOAD,0");    // stop if older M4
+      gSpinStopAtMs = 0;
+    }
+  }
 
   // RPC pump
   while (RPC.available()) {
