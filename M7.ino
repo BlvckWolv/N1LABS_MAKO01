@@ -1,37 +1,115 @@
-/*
-  Portenta H7 + Breakout + ST7789 (170x320)
-  Stable UI with:
-   - 5s splash ("N1LABS" + ASCII loading bar, flicker-free)
-   - Temp in °C from MAX17262 fuel-gauge (I2C 0x36, Wire1)
-   - M7/M4 load via RPC (robust parser)
-   - RIGHT tap = stress M4 (short real-time burst)
-   - Footer: left "N1LABS" chip, right static 8‑bit brightness icon + percent
+
+/* M7.ino — Portenta H7 (M7 core) + Breakout + ST7789 (170x320)
+   v3c
+   - Re-add fade-out after splash, fade-in for Home.
+   - Non-blocking RPC reads (no readStringUntil).
+   - Faster time sync: try known time.google.com IPs before DNS (no freeze).
+   - HTTP Date fallback kept; short timeouts.
+   - Footer: [W ON]/[W OFF] centered, [BL 0–100%] right; left N1LABS chip.
+   - Tiny 'x' between M7/M4 (green=linked, #ed8796 if M4 silent >2s).
+   - Brightness + time persisted via LittleFS (MBED).
 */
 
 #include <Arduino.h>
 #include <Arduino_PortentaBreakout.h>
-#include <SPI.h>
 #include <Arduino_GFX_Library.h>
-#include <string.h>
-#include <math.h>
-#include "mbed.h"
-#include <time.h>
-#include <RPC.h>
+#include <SPI.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <WiFiClient.h>
+#include <RPC.h>
+#include <LittleFS_Portenta_H7.h>
+#include <time.h>
 
-// Boot helper provided in your environment
 void bootM4(void);
 
-// ---------------- BoardTemp (MAX17262) inline ----------------
+// ====== USER WIFI CREDENTIALS ======
+#ifndef WIFI_SSID
+  #define WIFI_SSID "Wolv2.4"
+#endif
+#ifndef WIFI_PASS
+  #define WIFI_PASS "Eternal2049$!"
+#endif
+
+// ====== Display / pins ======
+#define ROTATION       1
+#define COLSTART       35
+#define ROWSTART       0
+#define INVERT_COLORS  0
+#define VIB_ACTIVE_LOW 0
+
+const int         PIN_CS    = SPI1_CS;
+const int         PIN_DC    = GPIO_2;
+const int         PIN_RST   = GPIO_1;
+const breakoutPin PIN_BL    = PWM3;     // ACTIVE-LOW PWM (higher value = brighter)
+const breakoutPin PIN_VIBR  = PWM4;
+
+const int BTN_RIGHT = GPIO_3;
+const int BTN_DOWN  = GPIO_4;
+const int BTN_LEFT  = GPIO_5;  // manual M4 reboot + RPC relink
+const int BTN_UP    = GPIO_6;
+const int BTN_OK    = GPIO_0;  // long-press => manual time sync
+
+// ====== Colors ======
+#define C565(r,g,b) ( ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | ((b) >> 3) )
+const uint16_t COL_BG       = C565(68, 74, 125);   // #444a7d
+const uint16_t COL_TEXT     = C565(235,239,245);
+const uint16_t COL_CHIP     = C565(166,218,149);   // #a6da95
+const uint16_t COL_CHIPFG   = COL_BG;
+const uint16_t COL_TIME_BG  = C565(183,189,248);   // #b7bdf8
+const uint16_t COL_DATE_BG  = C565(138,173,244);   // #8aadf4
+const uint16_t COL_BADLINK  = C565(237,135,150);   // #ed8796
+const uint16_t COL_CLK_TXT  = COL_BG;
+
+const int CHAR_W = 12; // font size 2
+const int CHAR_H = 16;
+const int VPAD   = 2;
+
+// ====== Storage (LittleFS MBED) ======
+LittleFS_MBED *gFS = nullptr;
+static const char *PATH_BL   = MBED_LITTLEFS_FILE_PREFIX "/bl.bin";
+static const char *PATH_TIME = MBED_LITTLEFS_FILE_PREFIX "/time.bin";
+
+static bool storageBegin(){
+  if (gFS) return true;
+  gFS = new LittleFS_MBED();
+  bool ok = gFS->init();
+  Serial.print("[FS] init "); Serial.println(ok ? "OK" : "FAIL");
+  return ok;
+}
+static void saveBrightnessFS(uint8_t v){
+  if (!storageBegin()) return;
+  FILE *f = fopen(PATH_BL, "wb"); if (!f) return;
+  fwrite(&v, 1, 1, f); fclose(f);
+}
+static bool restoreBrightnessFS(uint8_t &v){
+  if (!storageBegin()) return false;
+  FILE *f = fopen(PATH_BL, "rb"); if (!f) return false;
+  uint8_t t=0; size_t n = fread(&t, 1, 1, f); fclose(f);
+  if (n!=1) return false; v=t; return true;
+}
+static void saveTimeFS(time_t t){
+  if (!storageBegin()) return;
+  FILE *f = fopen(PATH_TIME, "wb"); if (!f) return;
+  int64_t v = (int64_t)t; fwrite(&v, 1, sizeof(v), f); fclose(f);
+}
+static bool restoreTimeFS(time_t &out){
+  if (!storageBegin()) return false;
+  FILE *f = fopen(PATH_TIME, "rb"); if (!f) return false;
+  int64_t v=0; size_t n = fread(&v, 1, sizeof(v), f); fclose(f);
+  if (n != sizeof(v)) return false; out=(time_t)v; return true;
+}
+
+// ====== Board Temp (MAX17262 on Wire1) ======
 namespace BoardTempInline {
   static const uint8_t ADDR = 0x36;
   static const uint8_t REG_TEMP    = 0x08; // signed, 1/256 °C
   static const uint8_t REG_DIETEMP = 0x34; // signed, 1/256 °C
-  static TwoWire &W = Wire1;               // Portenta Breakout fuel gauge on Wire1
+  static TwoWire &W = Wire1;
   static int       lastC  = -999;
   static uint32_t  lastMs = 0;
   static bool      ready  = false;
-
   static bool i2c_read16_le(uint8_t reg, uint16_t &out){
     W.beginTransmission(ADDR); W.write(reg);
     if (W.endTransmission(false) != 0) return false;
@@ -57,43 +135,22 @@ static inline void BoardTemp_begin(){ BoardTempInline::begin(); }
 static inline void BoardTemp_poll_1Hz(){ BoardTempInline::poll_1Hz(); }
 static inline int  BoardTemp_getC(){ return BoardTempInline::getC(); }
 
-// ---------------- Display / pins ----------------
-#define ROTATION       1
-#define COLSTART       35
-#define ROWSTART       0
-#define INVERT_COLORS  0
-#define VIB_ACTIVE_LOW 0
+// ====== GFX (avoid SPI ambiguity by not passing &SPI) ======
+Arduino_DataBus *bus = new Arduino_HWSPI(PIN_DC, PIN_CS);
+Arduino_GFX *gfx = new Arduino_ST7789(
+  bus, PIN_RST, ROTATION, true,
+  170, 320, COLSTART, ROWSTART, COLSTART, ROWSTART
+);
 
-const int         PIN_CS    = SPI1_CS;
-const int         PIN_DC    = GPIO_2;
-const int         PIN_RST   = GPIO_1;
-const breakoutPin PIN_BL    = PWM3;     // ACTIVE-LOW PWM (higher value = brighter)
-const breakoutPin PIN_VIBR  = PWM4;
+// ====== Backlight / Haptics ======
+static uint8_t gBrightness = 255;  // restored at setup
+static inline void blSetHW(uint8_t brightness) { Breakout.analogWrite(PIN_BL, 255 - brightness); } // ACTIVE-LOW
+static inline void vibOn(){  Breakout.digitalWrite(PIN_VIBR, VIB_ACTIVE_LOW ? LOW  : HIGH); }
+static inline void vibOff(){ Breakout.digitalWrite(PIN_VIBR, VIB_ACTIVE_LOW ? HIGH : LOW ); }
+static void vibrate(uint16_t ms){ vibOn(); delay(60); vibOff(); (void)ms; }
 
-const int BTN_RIGHT = GPIO_3;  // stress-load M4
-const int BTN_DOWN  = GPIO_4;
-const int BTN_LEFT  = GPIO_5;  // manual M4 reboot
-const int BTN_UP    = GPIO_6;
-const int BTN_OK    = GPIO_0;
-
-#define C565(r,g,b) ( ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | ((b) >> 3) )
-const uint16_t COL_BG     = C565(68, 74, 125);   // #444a7d
-const uint16_t COL_TEXT   = C565(235,239,245);
-const uint16_t COL_CHIP   = C565(166,218,149);   // #a6da95 (N1LABS)
-const uint16_t COL_CHIPFG = COL_BG;              // dark text
-const uint16_t COL_TIME_BG = C565(183,189,248);  // #b7bdf8
-const uint16_t COL_DATE_BG = C565(138,173,244);  // #8aadf4
-const uint16_t COL_CLK_TXT = COL_BG;             // dark text
-
-const int CHAR_W = 12; // font size 2
-const int CHAR_H = 16;
-const int VPAD   = 2;
-
-// ---- types & globals ----
+// ====== Buttons ======
 struct BtnState { uint8_t pin; bool pressed; const char* name; };
-struct BoxPx   { int x; int y; };
-BoxPx   gBoxTL, gBoxTR, gBoxBL, gBoxBR;
-
 BtnState buttons[5] = {
   { (uint8_t)BTN_UP,    false, "UP"    },
   { (uint8_t)BTN_DOWN,  false, "DOWN"  },
@@ -103,76 +160,263 @@ BtnState buttons[5] = {
 };
 const uint16_t DEBOUNCE_MS = 25;
 uint32_t lastChange[5] = {0,0,0,0,0};
+static void setupButtons(){ pinMode(BTN_UP,INPUT); pinMode(BTN_DOWN,INPUT); pinMode(BTN_LEFT,INPUT); pinMode(BTN_RIGHT,INPUT); pinMode(BTN_OK,INPUT); }
 
-uint8_t gBrightness = 255;  // full bright so splash is visible
+// ====== Footer geometry ======
+static bool footerInitDone=false;
+static int  footerY=0;
+static int  chipX=0, chipW=0, chipH=0;
+static int  wifiX=0, wifiW=0;
+static int  blX=0,   blW=0;
 
-volatile int gM4LoadPct = -1;
-volatile int gM4MHz     = 0;
-uint32_t     gM4LastMs  = 0;
+// ====== RTC / Time ======
+WiFiUDP ntpUDP;
+static const uint32_t RESYNC_INTERVAL_MS = 6UL*3600UL*1000UL;  // 6 hours
+static uint32_t nextResyncAt = 0;
 
-volatile bool gRebootM4Requested = false;
-volatile bool gSpinM4Requested   = false;
-static uint32_t gSpinStopAtMs = 0;
-
-// GFX
-Arduino_DataBus *bus = new Arduino_HWSPI(PIN_DC, PIN_CS, &SPI);
-Arduino_GFX *gfx = new Arduino_ST7789(
-  bus, PIN_RST, ROTATION, true,
-  170, 320, COLSTART, ROWSTART, COLSTART, ROWSTART
-);
-
-// ==== M7 CPU load ====
-#if __has_include("mbed_stats.h")
-  #include "mbed_stats.h"
-  #define HAS_MBED_CPU_STATS 1
-#else
-  #define HAS_MBED_CPU_STATS 0
-#endif
-
-static inline int m7MHz(){ return (int)(SystemCoreClock/1000000UL); }
-static float m7CpuLoadPct(bool &ready){
-  static uint64_t lastIdle=0,lastUp=0; ready=false;
-#if HAS_MBED_CPU_STATS
-  mbed_stats_cpu_t s; mbed_stats_cpu_get(&s);
-  if(lastUp==0){ lastIdle=s.idle_time; lastUp=s.uptime; return 0.0f; }
-  uint64_t dIdle=(s.idle_time>=lastIdle)?(s.idle_time-lastIdle):0;
-  uint64_t dUp  =(s.uptime   >=lastUp )?(s.uptime   -lastUp ):0;
-  lastIdle=s.idle_time; lastUp=s.uptime; if(dUp==0) return 0.0f;
-  float load=100.0f*(1.0f-(float)dIdle/(float)dUp);
-  if(load<0)load=0; if(load>100)load=100; ready=true; return load;
-#else
-  return 0.0f;
-#endif
+static inline void setTZ(){
+  setenv("TZ","CST6CDT,M3.2.0/2,M11.1.0/2",1); tzset(); // America/Chicago
+}
+static bool rtcLooksValid(){
+  time_t now = time(NULL);
+  return (now >= 1704067200); // >= Jan 1, 2024 UTC
 }
 
-// ==== Backlight / Haptics ====
-static inline void blSet(uint8_t brightness) { Breakout.analogWrite(PIN_BL, 255 - brightness); } // ACTIVE-LOW
-static inline void vibOn(){  Breakout.digitalWrite(PIN_VIBR, VIB_ACTIVE_LOW ? LOW  : HIGH); }
-static inline void vibOff(){ Breakout.digitalWrite(PIN_VIBR, VIB_ACTIVE_LOW ? HIGH : LOW ); }
-static void vibrate(uint16_t ms){ vibOn(); delay(ms); vibOff(); }
+// ====== WiFi / NTP async state-machine ======
+enum SyncState : uint8_t {
+  SYNC_IDLE=0, SYNC_START, SYNC_WAIT_WIFI, SYNC_FAST_NTP, SYNC_DNS, SYNC_NTP_SEND, SYNC_NTP_WAIT, SYNC_HTTP_DATE
+};
+static SyncState syncState = SYNC_IDLE;
+static uint32_t  syncStepStarted = 0;
+static uint32_t  wifiDeadline = 0;
+static IPAddress ntpIP;
+static uint8_t   ntpRetries = 0;
+static bool      wifiOn = false;
 
-// ===== ASCII boxes =====
+// pre-known time.google.com anycast IPs seen in your logs
+static IPAddress kFastNtpIPs[] = {
+  IPAddress(216,239,35,4),
+  IPAddress(216,239,35,8)
+};
+static uint8_t kFastNtpIdx = 0;
+
+static void wifiOff(){
+  if (wifiOn){
+    WiFi.disconnect();
+    WiFi.end();
+    wifiOn = false;
+    Serial.println("[WiFi] disconnected");
+  }
+}
+static void syncBegin(bool manual){
+  if (rtcLooksValid() && !manual){
+    nextResyncAt = millis() + RESYNC_INTERVAL_MS;
+    Serial.println("[SYNC] skip (RTC already valid)");
+    syncState = SYNC_IDLE;
+    return;
+  }
+  Serial.println(manual ? "[SYNC] start manual" : "[SYNC] start boot/scheduled");
+  WiFi.disconnect(); WiFi.end(); delay(5);
+  Serial.println("[WiFi] begin...");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  wifiOn = true;
+  wifiDeadline = millis() + 7000; // 7s cap
+  syncState = SYNC_WAIT_WIFI; syncStepStarted = millis(); ntpRetries = 0; kFastNtpIdx = 0;
+}
+static bool tj_sendNtpToIp(const IPAddress &ip){
+  const uint8_t NTP_PACKET_SIZE = 48;
+  uint8_t pkt[NTP_PACKET_SIZE]; memset(pkt, 0, sizeof(pkt));
+  pkt[0] = 0b11100011; pkt[2] = 6; pkt[3] = 0xEC; pkt[12]=49; pkt[13]=0x4E; pkt[14]=49; pkt[15]=52;
+  if (!ntpUDP.beginPacket(ip, 123)) return false;
+  ntpUDP.write(pkt, NTP_PACKET_SIZE);
+  return ntpUDP.endPacket()==1;
+}
+static bool tj_parseNtpTime(time_t &outUTC){
+  const uint8_t NTP_PACKET_SIZE = 48;
+  if (ntpUDP.parsePacket() < (int)NTP_PACKET_SIZE) return false;
+  uint8_t pkt[NTP_PACKET_SIZE]; ntpUDP.read(pkt, NTP_PACKET_SIZE);
+  uint32_t secsSince1900 = ((uint32_t)pkt[40]<<24) | ((uint32_t)pkt[41]<<16) | ((uint32_t)pkt[42]<<8) | (uint32_t)pkt[43];
+  const uint32_t seventyYears = 2208988800UL;
+  if (secsSince1900 < seventyYears) return false;
+  outUTC = (time_t)(secsSince1900 - seventyYears);
+  return true;
+}
+
+// --- UTC converter (no _rtc_maketime, no timegm) ---
+static time_t timegm_utc(const struct tm *t){
+  int year  = t->tm_year + 1900;
+  int month = t->tm_mon + 1;   // 1..12
+  int day   = t->tm_mday;      // 1..31
+  int a = (14 - month)/12;
+  int y = year + 4800 - a;
+  int m = month + 12*a - 3;
+  int days = day + (153*m + 2)/5 + 365*y + y/4 - y/100 + y/400 - 32045;
+  int days_since_epoch = days - 2440588;
+  long long secs = (long long)days_since_epoch * 86400LL
+                 + t->tm_hour * 3600LL + t->tm_min * 60LL + t->tm_sec;
+  return (time_t)secs;
+}
+
+// --- HTTP Date fallback (TCP/80) ---
+static bool parseHTTPDateToUnix(const char *dateLine, time_t &outUTC){
+  char wk[4]={0}, mon[4]={0};
+  int d=0,y=0,hh=0,mm=0,ss=0;
+  int n = sscanf(dateLine, "Date: %3s, %d %3s %d %d:%d:%d GMT", wk, &d, mon, &y, &hh, &mm, &ss);
+  if (n < 7) return false;
+  const char *months="JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char *p=strstr(months, mon); if(!p) return false;
+  int m = (int)((p - months)/3) + 1;
+  struct tm t; memset(&t,0,sizeof(t));
+  t.tm_year = y - 1900; t.tm_mon = m-1; t.tm_mday=d; t.tm_hour=hh; t.tm_min=mm; t.tm_sec=ss;
+  outUTC = timegm_utc(&t);
+  return (outUTC > 0);
+}
+static bool httpFetchDate(time_t &outUTC){
+  const char* hosts[] = {"google.com","example.com","cloudflare.com"};
+  WiFiClient client;
+  for (uint8_t i=0;i<3;i++){
+    const char* host = hosts[i];
+    client.setTimeout(500);
+    if (!client.connect(host, 80)){ continue; }
+    client.print(String("HEAD / HTTP/1.1\r\nHost: ") + host + "\r\nConnection: close\r\n\r\n");
+    uint32_t start = millis();
+    while (client.connected() && (millis()-start) < 1200){
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.startsWith("Date:")){
+        Serial.print("[HTTP] "); Serial.println(line);
+        time_t utc=0; if (parseHTTPDateToUnix(line.c_str(), utc)){ outUTC=utc; client.stop(); return true; }
+      }
+      if (line.length()==0) { break; }
+    }
+    client.stop();
+  }
+  return false;
+}
+
+static void syncPump(){
+  switch(syncState){
+    case SYNC_IDLE: break;
+    case SYNC_WAIT_WIFI:{
+      wl_status_t st = (wl_status_t)WiFi.status();
+      if (st == WL_CONNECTED){
+        Serial.print("[WiFi] IP="); Serial.println(WiFi.localIP());
+        if (!ntpUDP.begin(2390)) { Serial.println("[NTP] UDP begin fail"); syncState=SYNC_HTTP_DATE; break; }
+        syncState = SYNC_FAST_NTP; syncStepStarted=millis(); ntpRetries=0; kFastNtpIdx=0;
+      } else if ((int32_t)(millis()-wifiDeadline) >= 0){
+        Serial.println("[WiFi] connect timeout"); wifiOff(); syncState = SYNC_IDLE;
+      }
+    } break;
+    case SYNC_FAST_NTP:{
+      if (kFastNtpIdx < (sizeof(kFastNtpIPs)/sizeof(kFastNtpIPs[0]))){
+        IPAddress ip = kFastNtpIPs[kFastNtpIdx++];
+        if (tj_sendNtpToIp(ip)){ syncState = SYNC_NTP_WAIT; syncStepStarted = millis(); ntpIP = ip; }
+        else { /* try next on next tick */ }
+      } else {
+        syncState = SYNC_DNS; syncStepStarted=millis();
+      }
+    } break;
+    case SYNC_DNS:{
+      if (WiFi.hostByName("time.google.com", ntpIP) != 1){
+        Serial.println("[DNS] failed -> HTTP fallback"); ntpUDP.stop(); syncState = SYNC_HTTP_DATE;
+      } else {
+        Serial.print("[DNS] time.google.com -> "); Serial.println(ntpIP);
+        syncState = SYNC_NTP_SEND; syncStepStarted=millis(); ntpRetries=0;
+      }
+    } break;
+    case SYNC_NTP_SEND:{
+      if (!tj_sendNtpToIp(ntpIP)){ Serial.println("[NTP] send fail -> HTTP fallback"); ntpUDP.stop(); syncState = SYNC_HTTP_DATE; break; }
+      syncState = SYNC_NTP_WAIT; syncStepStarted = millis();
+    } break;
+    case SYNC_NTP_WAIT:{
+      time_t utc=0;
+      if (tj_parseNtpTime(utc)){
+        struct timeval tv; tv.tv_sec = utc; tv.tv_usec=0; settimeofday(&tv, nullptr);
+        saveTimeFS(utc);
+        setenv("TZ","CST6CDT,M3.2.0/2,M11.1.0/2",1); tzset();
+        time_t now=time(NULL); struct tm *lt=localtime(&now);
+        Serial.print("[NTP] OK UTC="); Serial.print((unsigned long)utc);
+        Serial.print(" Local "); Serial.print(lt->tm_mon+1); Serial.print('/'); Serial.print(lt->tm_mday);
+        Serial.print(' '); Serial.print(lt->tm_hour); Serial.print(':'); Serial.println(lt->tm_min);
+        nextResyncAt = millis() + 6UL*3600UL*1000UL;
+        ntpUDP.stop(); wifiOff(); syncState = SYNC_IDLE;
+      } else if ((millis() - syncStepStarted) > 1200){
+        if (++ntpRetries < 2){ syncState = (kFastNtpIdx<(sizeof(kFastNtpIPs)/sizeof(kFastNtpIPs[0])))? SYNC_FAST_NTP : SYNC_NTP_SEND; }
+        else { Serial.println("[NTP] timeout -> HTTP fallback"); ntpUDP.stop(); syncState = SYNC_HTTP_DATE; }
+      }
+    } break;
+    case SYNC_HTTP_DATE:{
+      time_t utc=0;
+      if (httpFetchDate(utc)){
+        struct timeval tv; tv.tv_sec = utc; tv.tv_usec=0; settimeofday(&tv, nullptr);
+        saveTimeFS(utc);
+        setenv("TZ","CST6CDT,M3.2.0/2,M11.1.0/2",1); tzset();
+        time_t now=time(NULL); struct tm *lt=localtime(&now);
+        Serial.print("[HTTP] OK UTC="); Serial.print((unsigned long)utc);
+        Serial.print(" Local "); Serial.print(lt->tm_mon+1); Serial.print('/'); Serial.print(lt->tm_mday);
+        Serial.print(' '); Serial.print(lt->tm_hour); Serial.print(':'); Serial.println(lt->tm_min);
+        nextResyncAt = millis() + 6UL*3600UL*1000UL;
+      } else {
+        Serial.println("[HTTP] Date fetch failed");
+      }
+      ntpUDP.stop(); wifiOff(); syncState = SYNC_IDLE;
+    } break;
+  }
+}
+
+// ====== Layout helpers ======
+struct BoxPx { int x; int y; };
+BoxPx   gBoxTL, gBoxTR, gBoxBL, gBoxBR;
+
+static void computeLayoutPx() {
+  const int BOX_W_PX   = 12 * CHAR_W;     // 144
+  const int TOP_H_PX   = 3  * CHAR_H;
+  const int BOT_H_PX   = 4  * CHAR_H;
+  const int W=320, H=170;
+  int x0 = 8;
+  int x1 = W - 8 - BOX_W_PX;
+  const int TOP = 24;
+  const int BOT = 24;
+  const int MIDG = H - TOP - BOT - TOP_H_PX - BOT_H_PX;
+  int yTop = TOP;
+  int yBot = TOP + TOP_H_PX + MIDG;
+  gBoxTL = { x0, yTop };
+  gBoxTR = { x1, yTop };
+  gBoxBL = { x0, yBot };
+  gBoxBR = { x1, yBot };
+  // Footer geometry
+  footerY = H - CHAR_H - 2;
+  const char *LOGO="N1LABS";
+  int textW=(int)strlen(LOGO)*CHAR_W; int padX=5, padY=1;
+  chipW = textW + padX*2; chipH = CHAR_H + padY*2 - 1; chipX = 8;
+  wifiW = (int)strlen("[W OFF]") * CHAR_W;
+  blW   = (int)strlen("[BL 100%]") * CHAR_W;
+  wifiX = (W - wifiW)/2;
+  blX   = W - 6 - blW;
+}
+
+static void drawTitleOnce(){
+  gfx->setTextColor(COL_TEXT, COL_BG); gfx->setTextSize(2);
+  gfx->setCursor(8,2); gfx->print("Portenta H7");
+}
+
+// Boxes
 static void drawNiceBox(int x, int y, int wChars, const char* label, const char* value) {
   if (wChars < 8) return;
   const int inner = wChars - 2;
   static char line1[64], line2[64], line3[64];
-
   int labLen = (int)strlen(label); if (labLen > inner - 2) labLen = inner - 2;
   int coreLen = labLen + 2; int rem = inner - coreLen;
   int leftFill = rem/2, rightFill = rem - leftFill;
-
   int p=0; line1[p++]='+'; for(int i=0;i<leftFill;i++) line1[p++]='-';
   line1[p++]='['; for(int i=0;i<labLen;i++) line1[p++]=label[i]; line1[p++]=']';
   for(int i=0;i<rightFill;i++) line1[p++]='-'; line1[p++]='+'; line1[p]=0;
-
   int valLen = (int)strlen(value); if (valLen > inner) valLen = inner;
   int space = inner - valLen; int lpad = space/2; int rpad = space - lpad;
   p=0; line2[p++]='|'; for(int i=0;i<lpad;i++) line2[p++]=' ';
   for(int i=0;i<valLen;i++) line2[p++]=value[i];
   for(int i=0;i<rpad;i++) line2[p++]=' '; line2[p++]='|'; line2[p]=0;
-
   p=0; line3[p++]='+'; for(int i=0;i<inner;i++) line3[p++]='-'; line3[p++]='+'; line3[p]=0;
-
   gfx->setTextColor(COL_TEXT, COL_BG); gfx->setTextSize(2);
   gfx->setCursor(x, y);                         gfx->print(line1);
   gfx->setCursor(x, y + CHAR_H + VPAD);         gfx->print(line2);
@@ -183,15 +427,12 @@ static void drawInfoBox(int x, int y, int wChars, const char* label, const char*
   if (wChars < 8) return;
   const int inner = wChars - 2;
   static char top[64], mid1[64], mid2[64], bot[64];
-
   int labLen = (int)strlen(label); if (labLen > inner - 2) labLen = inner - 2;
   int coreLen = labLen + 2, rem = inner - coreLen;
   int leftFill = rem/2, rightFill = rem - leftFill;
-
   int p=0; top[p++]='+'; for(int i=0;i<leftFill;i++) top[p++]='-';
   top[p++]='['; for(int i=0;i<labLen;i++) top[p++]=label[i]; top[p++]=']';
   for(int i=0;i<rightFill;i++) top[p++]='-'; top[p++]='+'; top[p]=0;
-
   auto mid = [&](char* dst, const char* txt){
     int tlen = (int)strlen(txt); if (tlen > inner) tlen = inner;
     int lpad = 1, rpad = inner - lpad - tlen; if (rpad < 0) rpad = 0;
@@ -202,9 +443,7 @@ static void drawInfoBox(int x, int y, int wChars, const char* label, const char*
   };
   mid(mid1, lineA);
   mid(mid2, lineB);
-
   p=0; bot[p++]='+'; for(int i=0;i<inner;i++) bot[p++]='-'; bot[p++]='+'; bot[p]=0;
-
   gfx->setTextColor(COL_TEXT, COL_BG); gfx->setTextSize(2);
   gfx->setCursor(x, y);                           gfx->print(top);
   gfx->setCursor(x, y + CHAR_H + VPAD);           gfx->print(mid1);
@@ -212,36 +451,45 @@ static void drawInfoBox(int x, int y, int wChars, const char* label, const char*
   gfx->setCursor(x, y + 3*CHAR_H + 2*VPAD);       gfx->print(bot);
 }
 
-// ===== Layout (2x2) =====
-static void computeLayoutPx() {
-  const int BOX_W_PX   = 12 * CHAR_W;     // 144
-  const int TOP_H_PX   = 3  * CHAR_H;
-  const int BOT_H_PX   = 4  * CHAR_H;
+// ====== Footer ======
+static int lastBLpct=-1;
+static bool wifiShownOn=false;
 
-  const int W=320, H=170;
-  int x0 = 8;
-  int x1 = W - 8 - BOX_W_PX;
-
-  const int TOP = 24;
-  const int BOT = 24;
-  const int MIDG = H - TOP - BOT - TOP_H_PX - BOT_H_PX;
-
-  int yTop = TOP;
-  int yBot = TOP + TOP_H_PX + MIDG;
-
-  gBoxTL = { x0, yTop };
-  gBoxTR = { x1, yTop };
-  gBoxBL = { x0, yBot };
-  gBoxBR = { x1, yBot };
+static void drawFooterWiFi(bool on){
+  const char *t = on ? "[W ON]" : "[W OFF]";
+  gfx->fillRect(wifiX, footerY-1, wifiW, CHAR_H+2, COL_BG);
+  gfx->setTextColor(COL_TEXT, COL_BG); gfx->setTextSize(2); gfx->setCursor(wifiX, footerY); gfx->print(t);
+  wifiShownOn = on;
+}
+static void drawFooterBLIfChanged(){
+  int pct = (int)gBrightness * 100 / 255;
+  if (!footerInitDone || pct==lastBLpct) return;
+  lastBLpct=pct;
+  char txt[20]; snprintf(txt,sizeof(txt),"[BL %d%%]", pct);
+  gfx->fillRect(blX, footerY-1, blW, CHAR_H+2, COL_BG);
+  gfx->setTextColor(COL_TEXT, COL_BG); gfx->setTextSize(2); gfx->setCursor(blX, footerY); gfx->print(txt);
+}
+static void drawFooterInit(){
+  // whole footer strip
+  gfx->fillRect(0, footerY-1, 320, CHAR_H+3, COL_BG);
+  // Left chip
+  const char *LOGO="N1LABS"; int textW=(int)strlen(LOGO)*CHAR_W; int padX=5,padY=1;
+  int chipY = footerY-1, radius=2;
+  gfx->fillRoundRect(chipX, chipY, chipW, chipH, radius, COL_CHIP);
+  gfx->setTextColor(COL_CHIPFG, COL_CHIP); gfx->setTextSize(2); gfx->setCursor(chipX+padX, footerY); gfx->print(LOGO);
+  // Center WiFi placeholder + Right BL
+  drawFooterWiFi(false);
+  lastBLpct=-1; drawFooterBLIfChanged();
+  footerInitDone=true;
+}
+static void drawFooterMaintain(){
+  if (!footerInitDone) drawFooterInit();
+  drawFooterBLIfChanged();
+  bool on = (WiFi.status()==WL_CONNECTED) || (syncState==SYNC_WAIT_WIFI || syncState==SYNC_FAST_NTP || syncState==SYNC_DNS || syncState==SYNC_NTP_SEND || syncState==SYNC_NTP_WAIT || syncState==SYNC_HTTP_DATE);
+  if (on != wifiShownOn) drawFooterWiFi(on);
 }
 
-// ===== Title =====
-static void drawTitleOnce(){
-  gfx->setTextColor(COL_TEXT, COL_BG); gfx->setTextSize(2);
-  gfx->setCursor(8,2); gfx->print("Portenta H7");
-}
-
-// ===== Clock chips (Time + Date) =====
+// ====== Clock chips (Time + Date) ======
 static char gPrevClk[32]={0};
 const int CLK_Y = 2;
 const int CLK_AREA_W = 14 * CHAR_W;
@@ -267,146 +515,164 @@ static void drawClockChips(bool force){
   gfx->setTextColor(COL_CLK_TXT, COL_DATE_BG); gfx->setCursor(x2+padX, CLK_Y); gfx->print(dbuf);
 }
 
-// ===== Pixel-art brightness icon (static) =====
-static void drawBrightnessIcon8(int x, int y, uint16_t fg, uint16_t bg, uint8_t /*level*/, int s){
-  // Clear a safe bounding box (~(5+2)*s square)
-  int bw = (5+2)*s, bh = (5+2)*s;
-  gfx->fillRect(x, y, bw, bh, COL_BG);
-
-  // Core: 3x3 square centered in 5x5 grid
-  for (int dy=1; dy<=3; ++dy){
-    for (int dx=1; dx<=3; ++dx){
-      gfx->fillRect(x + (dx*s), y + (dy*s), s, s, fg);
-    }
-  }
-  // Always show all 8 rays (static icon)
-  const int RX[8] = {2,4,2,0,4,4,0,0};
-  const int RY[8] = {0,2,4,2,0,4,4,0};
-  for (int i=0; i<8; ++i){
-    gfx->fillRect(x + RX[i]*s, y + RY[i]*s, s, s, fg);
+// ====== Fade helpers (brief, acceptable blocking during transition) ======
+static void fadeTo(uint8_t target, uint16_t ms){
+  uint8_t start = gBrightness;
+  uint32_t t0 = millis();
+  while (true){
+    float f = (millis()-t0) / (float)ms; if (f<0) f=0; if (f>1) f=1;
+    int cur = (int)(start + (target - start)*f);
+    blSetHW((uint8_t)cur);
+    if (f>=1) break;
+    delay(8);
   }
 }
-
-// Stretch to exact square (size x size) so icon width == height (matches chip visually)
-static void drawBrightnessIcon8_fitSquare(int x, int y, uint16_t fg, uint16_t bg, uint8_t /*level*/, int size){
-  if (size < 7) { drawBrightnessIcon8(x, y, fg, bg, 0, 1); return; }
-  int base = size / 7;
-  int rem  = size - base*7;          // 0..6
-  int rowH[7], colW[7], rowY[7], colX[7];
-  for (int i=0;i<7;i++){ rowH[i]=base + (i<rem?1:0); colW[i]=base + (i<rem?1:0); }
-  rowY[0]=0; colX[0]=0;
-  for (int i=1;i<7;i++){ rowY[i]=rowY[i-1]+rowH[i-1]; colX[i]=colX[i-1]+colW[i-1]; }
-  gfx->fillRect(x, y, size, size, bg);
-  auto g5to7 = [](int v){ return v+1; }; // center 5x5 inside 7x7
-
-  // core 3x3
-  for (int dy=1; dy<=3; ++dy){
-    int ry = g5to7(dy);
-    for (int dx=1; dx<=3; ++dx){
-      int rx = g5to7(dx);
-      gfx->fillRect(x + colX[rx], y + rowY[ry], colW[rx], rowH[ry], fg);
-    }
-  }
-  // rays
-  const int RX[8] = {2,4,2,0,4,4,0,0};
-  const int RY[8] = {0,2,4,2,0,4,4,0};
-  for (int i=0;i<8;i++){
-    int rx = g5to7(RX[i]);
-    int ry = g5to7(RY[i]);
-    gfx->fillRect(x + colX[rx], y + rowY[ry], colW[rx], rowH[ry], fg);
-  }
+static void fadeOutInForHome(){
+  uint8_t orig = gBrightness;
+  fadeTo(0, 250);
+  // caller will draw Home screen here (with backlight off)
+  // fade back up
+  fadeTo(orig, 250);
 }
 
-// Footer BL icon + N1LABS chip
-static bool footerInitDone=false; static int lastBLpct=-1;
-static void drawFooterInit(){
-  const int y = 170 - CHAR_H - 2;
-  gfx->fillRect(0, y, 320, CHAR_H+2, COL_BG);
-  const char *LOGO="N1LABS"; int textW=(int)strlen(LOGO)*CHAR_W; int padX=5,padY=1;
-  int chipW=textW+padX*2, chipH=CHAR_H+padY*2-1, chipX=8, chipY=y-1, radius=2; // bottom +1 px
-  gfx->fillRoundRect(chipX, chipY, chipW, chipH, radius, COL_CHIP);
-  gfx->setTextColor(COL_CHIPFG, COL_CHIP); gfx->setTextSize(2); gfx->setCursor(chipX+padX, y); gfx->print(LOGO);
-  footerInitDone=true; lastBLpct=-1;
-}
-
-static void drawFooterBLIfChanged(){
-  const int y = 170 - CHAR_H - 2;
-  int pct = (int)gBrightness * 100 / 255;
-
-  // Layout constants
-  const int chipPadY = 1;
-  const int chipH = CHAR_H + chipPadY*2 - 1;
-  const int chipTop = y - 1;
-  const int cw2 = 12;                 // font width at size=2
-  const int padEdge = 6;
-
-  // Cache icon geometry and draw only once so it never "animates"
-  static bool iconDrawn = false;
-  static int iconSize = 0;
-  static int iconX = 0, iconY = 0;
-  static int txtX = 0, txtY = 0;
-  static int txtMaxW = 0;
-
-  if (!iconDrawn){
-    iconSize = chipH;                 // square equal to chip height
-    const char *maxTxt = ":100%";     // tight, no spaces
-    txtMaxW = (int)strlen(maxTxt) * cw2;
-
-    const int groupW = iconSize + txtMaxW;   // no gap (we'll overlap text by 2px)
-    const int groupX = 320 - padEdge - groupW;
-
-    iconX = groupX;
-    iconY = chipTop;
-    drawBrightnessIcon8_fitSquare(iconX, iconY, COL_TEXT, COL_BG, 0 /*ignored*/, iconSize);
-
-    // 2px tighter: place text 2 pixels into the icon's bbox
-    txtX = iconX + iconSize - 2;
-    txtY = y;
-
-    iconDrawn = true;
-  }
-
-  // Only update the percent text if changed; do NOT erase/redraw the icon
-  static int lastPct = -1;
-  if (pct == lastPct && footerInitDone) return;
-  lastPct = pct;
-
-  // Clear just the text box area
-  gfx->fillRect(txtX, txtY-1, txtMaxW+2, CHAR_H+2, COL_BG);
-
-  // Render ":NN%"
-  char txt[16]; snprintf(txt, sizeof(txt), ":%d%%", pct);
+// ====== Splash (5s, then fade out) ======
+static void showSplash5s(){
+  gfx->fillScreen(COL_BG);
   gfx->setTextColor(COL_TEXT, COL_BG);
+  const char *label = "N1LABS";
+  const int cw3 = 18, ch3 = 24;
+  int lw = (int)strlen(label) * cw3;
+  int lx = (320 - lw)/2;
+  int ly = (170 - ch3)/2 - 12;
+  gfx->setTextSize(3); gfx->setCursor(lx, ly); gfx->print(label);
+  const int cw2 = 12, ch2 = 16;
+  const int barChars = 14;
+  int bar_px = (barChars + 2) * cw2;
+  int x = (320 - bar_px) / 2;
+  int y = ly + ch3 + 4;
   gfx->setTextSize(2);
-  gfx->setCursor(txtX, txtY);
-  gfx->print(txt);
+  gfx->setCursor(x, y); gfx->print('[');
+  for (int i=0;i<barChars;i++) gfx->print(' ');
+  gfx->print(']');
+  const char *msgTemplate = "Initializing... 100%";
+  int msg_w = (int)strlen(msgTemplate) * cw2;
+  int msg_x = (320 - msg_w)/2;
+  int msg_y = y + ch2 + 2;
+  int last_filled = 0;
+  int last_pct = -1;
+  uint32_t start = millis();
+  while (millis() - start < 5000){
+    float frac = (float)(millis() - start) / 5000.0f; if (frac<0) frac=0; if (frac>1) frac=1;
+    int filled = (int)floorf(frac * barChars + 0.5f);
+    int pct    = (int)roundf(frac * 100.0f);
+    if (filled > last_filled){
+      for (int i = last_filled; i < filled; ++i){
+        gfx->setCursor(x + cw2*(1 + i), y); gfx->print('=');
+      }
+      last_filled = filled;
+    }
+    if (pct != last_pct){
+      char msg[32]; snprintf(msg, sizeof(msg), "Initializing... %3d%%", pct);
+      gfx->setCursor(msg_x, msg_y); gfx->print(msg); last_pct = pct;
+    }
+    delay(30);
+  }
+  // Fade out to transition to Home
+  fadeTo(0, 250);
 }
 
-static void drawFooterOnceThenMaintain(){ if(!footerInitDone) drawFooterInit(); drawFooterBLIfChanged(); }
+// ====== M7 CPU load ======
+#if __has_include("mbed_stats.h")
+  #include "mbed_stats.h"
+  #define HAS_MBED_CPU_STATS 1
+#else
+  #define HAS_MBED_CPU_STATS 0
+#endif
+static inline int m7MHz(){ return (int)(SystemCoreClock/1000000UL); }
+static float m7CpuLoadPct(bool &ready){
+  static uint64_t lastIdle=0,lastUp=0; ready=false;
+#if HAS_MBED_CPU_STATS
+  mbed_stats_cpu_t s; mbed_stats_cpu_get(&s);
+  if(lastUp==0){ lastIdle=s.idle_time; lastUp=s.uptime; return 0.0f; }
+  uint64_t dIdle=(s.idle_time>=lastIdle)?(s.idle_time-lastIdle):0;
+  uint64_t dUp  =(s.uptime   >=lastUp )?(s.uptime   -lastUp ):0;
+  lastIdle=s.idle_time; lastUp=s.uptime; if(dUp==0) return 0.0f;
+  float load=100.0f*(1.0f-(float)dIdle/(float)dUp);
+  if(load<0)load=0; if(load>100)load=100; ready=true; return load;
+#else
+  return 0.0f;
+#endif
+}
 
-// ===== Buttons =====
-static void setupButtons(){ pinMode(BTN_UP,INPUT); pinMode(BTN_DOWN,INPUT); pinMode(BTN_LEFT,INPUT); pinMode(BTN_RIGHT,INPUT); pinMode(BTN_OK,INPUT); }
-static void adjustBrightness(int d){ int v=(int)gBrightness+d; v=constrain(v,0,255); if(v!=gBrightness){ gBrightness=(uint8_t)v; blSet(gBrightness); drawFooterBLIfChanged(); } }
-static void updateButton(uint8_t i){
-  BtnState &b = buttons[i];
-  bool raw=(digitalRead(b.pin)==LOW); uint32_t now=millis();
-  if(raw!=b.pressed && (now-lastChange[i])>DEBOUNCE_MS){
-    b.pressed=raw; lastChange[i]=now;
-    if(b.pressed){
-      vibOn(); delay(80); vibOff();
-      if(b.pin==BTN_UP)   adjustBrightness(+16);
-      if(b.pin==BTN_DOWN) adjustBrightness(-16);
-      if(b.pin==BTN_LEFT) gRebootM4Requested = true;
-      if(b.pin==BTN_RIGHT) gSpinM4Requested  = true;
+// ====== M4 link + stats via RPC ======
+volatile int gM4LoadPct = -1;
+volatile int gM4MHz     = 200;
+static uint32_t gM4LastMs = 0;
+static bool m4AutoBootTried = false;
+static bool postTasksStarted=false;
+static uint32_t postTasksAt=0;
+
+// non-blocking line reader for RPC
+static String gRpcBuf;
+static void rpcPumpNonBlocking(){
+  while (RPC.available()){
+    char c = (char)RPC.read();
+    if (c=='\r') continue;
+    if (c=='\n'){
+      String line = gRpcBuf; gRpcBuf="";
+      line.trim();
+      if (line.length()){
+        // handle
+        if (line.startsWith("M4,")) {
+          char buf[64]; line.toCharArray(buf, sizeof(buf));
+          int load= -1, mhz = 0;
+          if (2 == sscanf(buf, "M4,%d,%d", &load, &mhz)) {
+            if (load < 0) load = -1; if (load > 100) load = 100;
+            if (mhz >= 1800 && mhz <= 2200) mhz /= 10;  // fix "2004"
+            if (mhz < 0 || mhz > 600) mhz = 200;
+            gM4LoadPct = load; gM4MHz = mhz; gM4LastMs = millis();
+          }
+        } else if (line.startsWith("M4:HB") || line.startsWith("M4:READY") || line.startsWith("M4:PONG")) {
+          gM4LastMs = millis();
+        }
+      }
+    } else {
+      if (gRpcBuf.length() < 120) gRpcBuf += c;
     }
   }
 }
 
-// ===== Helpers =====
-static inline void fmtCpuLines(char *l1, size_t n1, char *l2, size_t n2, int pct, int mhz){
-  if (pct < 0) { snprintf(l1,n1,"L: OFF"); snprintf(l2,n2,"F: %dMHz", mhz); }
-  else         { snprintf(l1,n1,"L: %d%%", pct); snprintf(l2,n2,"F: %dMHz", mhz); }
+static void drawMidLinkX(){
+  const int cx = (gBoxBL.x + (gBoxBR.x+12*CHAR_W))/2 - CHAR_W/2;
+  const int cy = gBoxBL.y + (2*CHAR_H + VPAD);
+  bool linked = (millis() - gM4LastMs) < 2000;
+  uint16_t c = linked ? COL_CHIP : COL_BADLINK;
+  gfx->setTextColor(c, COL_BG); gfx->setTextSize(2);
+  gfx->setCursor(cx, cy); gfx->print('x');
 }
+
+// ====== Brightness helpers ======
+static void adjustBrightness(int d){
+  int v=(int)gBrightness+d; v=constrain(v,0,255);
+  if (v!=gBrightness){ gBrightness=(uint8_t)v; blSetHW(gBrightness); saveBrightnessFS(gBrightness); drawFooterBLIfChanged(); }
+}
+
+// ====== OK long-press for manual sync (non-blocking) ======
+static bool okWasDown=false; static uint32_t okDownMs=0;
+static void pollOkLongPress(){
+  bool down = (digitalRead(BTN_OK)==LOW);
+  uint32_t now=millis();
+  if (down && !okWasDown){ okWasDown=true; okDownMs=now; }
+  else if (!down && okWasDown){ okWasDown=false; }
+  if (down && okWasDown && (now-okDownMs>700)){
+    Serial.println("[SYNC] manual trigger (OK long-press)");
+    vibrate(60);
+    syncBegin(true);
+    okWasDown=false;
+  }
+}
+
+// ====== Helpers ======
 static void fmtUptime(char *out, size_t n){
   uint32_t ms = millis();
   uint32_t sec = ms / 1000;
@@ -417,189 +683,135 @@ static void fmtUptime(char *out, size_t n){
   else          snprintf(out, n, "%02lu:%02lu:%02lu", (unsigned long)hrs, (unsigned long)mins, (unsigned long)sec);
 }
 
-// ===== RPC helper =====
-static void handleRPCLine(const String &s){
-  if (s.startsWith("M4,")) {
-    char buf[64]; s.toCharArray(buf, sizeof(buf));
-    int load= -1, mhz = 0;
-    if (2 == sscanf(buf, "M4,%d,%d", &load, &mhz)) {
-      if (load < 0) load = -1; if (load > 100) load = 100;
-      if (mhz >= 1800 && mhz <= 2200) mhz /= 10;  // fix "2004"
-      if (mhz < 0 || mhz > 600) mhz = 200;
-      gM4LoadPct = load; gM4MHz = mhz; gM4LastMs = millis();
-    }
-  } else if (s.startsWith("M4:HB") || s.startsWith("M4:READY")) {
-    gM4LastMs = millis();
-  }
-}
-
-// ===== Splash (5s) =====
-static void showSplash5s(){
-  gfx->fillScreen(COL_BG);
-  gfx->setTextColor(COL_TEXT, COL_BG); // text overwrites without clear
-
-  const char *label = "N1LABS";
-  const int cw3 = 18, ch3 = 24;
-  int lw = (int)strlen(label) * cw3;
-  int lx = (320 - lw)/2;
-  int ly = (170 - ch3)/2 - 12; // a bit higher to fit bar + text
-
-  gfx->setTextSize(3);
-  gfx->setCursor(lx, ly);
-  gfx->print(label);
-
-  // Shorter ASCII loading bar under the label (static frame, incremental fill)
-  const int cw2 = 12, ch2 = 16;
-  const int barChars = 14; // shorter bar
-  int bar_px = (barChars + 2) * cw2; // [ + chars + ]
-  int x = (320 - bar_px) / 2;
-  int y = ly + ch3 + 4; // directly under the logo
-
-  gfx->setTextSize(2);
-  // Draw static frame: [              ]
-  gfx->setCursor(x, y);
-  gfx->print('[');
-  for (int i=0;i<barChars;i++) gfx->print(' ');
-  gfx->print(']');
-
-  // Fixed-width status text (no flicker)
-  const char *msgTemplate = "Initializing... 100%";
-  int msg_w = (int)strlen(msgTemplate) * cw2;
-  int msg_x = (320 - msg_w)/2;
-  int msg_y = y + ch2 + 2;
-
-  int last_filled = 0;
-  int last_pct = -1;
-
-  uint32_t start = millis();
-  while (millis() - start < 5000){
-    float frac = (float)(millis() - start) / 5000.0f; if (frac<0) frac=0; if (frac>1) frac=1;
-    int filled = (int)floorf(frac * barChars + 0.5f);
-    int pct    = (int)roundf(frac * 100.0f);
-
-    if (filled > last_filled){
-      for (int i = last_filled; i < filled; ++i){
-        gfx->setCursor(x + cw2*(1 + i), y);
-        gfx->print('=');
-      }
-      last_filled = filled;
-    }
-
-    if (pct != last_pct){
-      char msg[32];
-      snprintf(msg, sizeof(msg), "Initializing... %3d%%", pct);
-      gfx->setCursor(msg_x, msg_y);
-      gfx->print(msg);
-      last_pct = pct;
-    }
-    delay(30);
-  }
-
-  for (int i = last_filled; i < barChars; ++i){
-    gfx->setCursor(x + cw2*(1 + i), y);
-    gfx->print('=');
-  }
-  gfx->setCursor(msg_x, msg_y);
-  gfx->print("Initializing... 100%");
-}
-
-// ===== SETUP / LOOP =====
+// ====== SETUP / LOOP ======
 void setup() {
   Serial.begin(115200);
+
+  storageBegin();
+  uint8_t savedBL=0; if (restoreBrightnessFS(savedBL)) gBrightness = savedBL;
+  Breakout.pinMode(PIN_BL, OUTPUT); blSetHW(gBrightness);
+
+  time_t tSaved=0; if (!rtcLooksValid() && restoreTimeFS(tSaved)){ struct timeval tv; tv.tv_sec = tSaved; tv.tv_usec=0; settimeofday(&tv, nullptr); }
+  setTZ();
+  if (rtcLooksValid()) nextResyncAt = millis() + RESYNC_INTERVAL_MS;
+
+  Breakout.pinMode(PIN_VIBR, OUTPUT); vibOff();
+  setupButtons();
   BoardTemp_begin();
 
-  Breakout.pinMode(PIN_BL, OUTPUT);
-  blSet(gBrightness);
-
-  SPI.begin(); gfx->begin(48000000); gfx->invertDisplay(INVERT_COLORS);
+  gfx->begin(48000000);
+  gfx->invertDisplay(INVERT_COLORS);
   gfx->setTextWrap(false); gfx->setTextSize(2); gfx->setTextColor(COL_TEXT, COL_BG);
-  setupButtons(); Breakout.pinMode(PIN_VIBR, OUTPUT); vibOff();
-
-  // Splash first, guaranteed visible
-  showSplash5s();
-  gfx->fillScreen(COL_BG);
-
   computeLayoutPx();
 
-  // UI skeleton
-  drawTitleOnce(); drawClockChips(true); drawFooterOnceThenMaintain();
-  drawNiceBox(gBoxTL.x, gBoxTL.y, 12, "Temp", "--");
-  char upt[16]; fmtUptime(upt, sizeof(upt)); drawNiceBox(gBoxTR.x, gBoxTR.y, 12, "UPT", upt);
-  char a[24], b[24];
-  fmtCpuLines(a,sizeof(a), b,sizeof(b), -1, m7MHz()); drawInfoBox(gBoxBL.x, gBoxBL.y, 12, "M7", a, b);
-  fmtCpuLines(a,sizeof(a), b,sizeof(b), -1, 0);       drawInfoBox(gBoxBR.x, gBoxBR.y, 12, "M4", a, b);
+  showSplash5s(); // ends with fade to black
 
-  // Start RPC AFTER UI so UI is not blocked by waits
-  RPC.begin();
-  bootM4();
+  // Draw Home with backlight off, then fade back in
+  gfx->fillScreen(COL_BG);
+  computeLayoutPx();
+  drawTitleOnce(); drawClockChips(true); 
+  drawNiceBox(gBoxTL.x, gBoxTL.y, 12, "Temp", "--");
+  drawNiceBox(gBoxTR.x, gBoxTR.y, 12, "UPT",  "00:00:00");
+  drawInfoBox(gBoxBL.x, gBoxBL.y, 12, "M7", "L: --", "F: 480MHz");
+  drawInfoBox(gBoxBR.x, gBoxBR.y, 12, "M4", "L: OFF", "F: 200MHz");
+  drawMidLinkX();
+  // footer before fade-in so text is ready
+  footerInitDone=false; drawFooterInit();
+  // fade back to saved brightness
+  fadeTo(gBrightness, 250);
+
+  postTasksAt = millis() + 50;
 }
 
 void loop() {
-  // Temp
+  if (!postTasksStarted && (int32_t)(millis()-postTasksAt) >= 0){
+    postTasksStarted = true;
+    RPC.begin();
+    bootM4();
+    Serial.println("[RPC] boot M4");
+    m4AutoBootTried = false;
+    if (!rtcLooksValid()) syncBegin(false);
+  }
+
   BoardTemp_poll_1Hz();
 
   // Buttons
-  for (uint8_t i = 0; i < 5; ++i) updateButton(i);
-
-  if (gRebootM4Requested) { gRebootM4Requested = false; bootM4(); }
-  if (gSpinM4Requested)   {
-    gSpinM4Requested = false;
-    // Start a short ~real-time burst
-    const uint32_t SPIN_BURST_MS = 1200;
-    gSpinStopAtMs = millis() + SPIN_BURST_MS;
-  }
-  static uint32_t lastSpinTxMs = 0;
-  const uint32_t SPIN_CMD_PERIOD_MS = 100;  // faster resend for snappier response
-  if (gSpinStopAtMs){
-    if (millis() - lastSpinTxMs >= SPIN_CMD_PERIOD_MS){
-      RPC.println("SPIN,1200");     // newer M4
-      RPC.println("TESTLOAD,1");    // older M4 fallback
-      lastSpinTxMs = millis();
-    }
-    if (millis() >= gSpinStopAtMs){
-      RPC.println("TESTLOAD,0");    // stop if older M4
-      gSpinStopAtMs = 0;
+  for (uint8_t i=0;i<5;i++){
+    BtnState &b = buttons[i];
+    bool raw=(digitalRead(b.pin)==LOW); uint32_t now=millis();
+    if(raw!=b.pressed && (now-lastChange[i])>DEBOUNCE_MS){
+      b.pressed=raw; lastChange[i]=now;
+      if(b.pressed){
+        vibOn(); delay(50); vibOff();
+        if(b.pin==BTN_UP)   adjustBrightness(+16);
+        if(b.pin==BTN_DOWN) adjustBrightness(-16);
+        if(b.pin==BTN_LEFT) {
+          Serial.println("[RPC] manual M4 reboot");
+          bootM4();
+          delay(30);
+          RPC.end();
+          delay(20);
+          RPC.begin();
+        }
+      }
     }
   }
+  pollOkLongPress();
 
-  // RPC pump
-  while (RPC.available()) {
-    String s = RPC.readStringUntil('\n'); s.trim(); handleRPCLine(s);
+  // Periodic ping to help liveness
+  static uint32_t lastPing=0;
+  if ((millis()-lastPing) > 1000){
+    RPC.println("PING");
+    lastPing = millis();
   }
 
-  // If M4 silent >3s, mark as off (no blocking waits)
-  if ((millis() - gM4LastMs) > 2000) { gM4LoadPct = -1; }
+  // RPC pump (non-blocking)
+  rpcPumpNonBlocking();
 
-  // Clock refresh each second
+  // If M4 stayed silent for ~3s after first boot, try once more
+  static uint32_t firstBootAt = 0;
+  if (!firstBootAt && postTasksStarted) firstBootAt = millis();
+  if (postTasksStarted && !m4AutoBootTried && (millis()-firstBootAt)>3000 && (millis()-gM4LastMs)>2500){
+    Serial.println("[RPC] auto-boot M4 (no HB)");
+    bootM4();
+    m4AutoBootTried = true;
+  }
+
+  if (nextResyncAt && (int32_t)(millis()-nextResyncAt) >= 0 && syncState==SYNC_IDLE){
+    syncBegin(false);
+  }
+
+  syncPump();
+
   static int lastSec=-1; time_t now=time(NULL); struct tm *t=localtime(&now);
   if (t->tm_sec!=lastSec){ lastSec=t->tm_sec; drawClockChips(false); }
 
-  // UI refresh ~300 ms
   static uint32_t tmo=0;
   if (millis()-tmo > 300) {
     tmo = millis();
 
-    // Temp °C
     char temp[16] = "--";
     int __c = BoardTemp_getC();
     if (__c != -999) snprintf(temp, sizeof(temp), "%dC", __c);
     drawNiceBox(gBoxTL.x, gBoxTL.y, 12, "Temp", temp);
 
-    // Uptime
     char upt[16]; fmtUptime(upt, sizeof(upt));
     drawNiceBox(gBoxTR.x, gBoxTR.y, 12, "UPT", upt);
 
-    // M7 CPU
     bool ready=false; float load = m7CpuLoadPct(ready);
     int pct = ready ? (int)roundf(load) : -1;
-    char a[24], b[24]; fmtCpuLines(a,sizeof(a), b,sizeof(b), pct, m7MHz());
+    char a[24], b[24];
+    if (pct < 0) snprintf(a,sizeof(a),"L: OFF"); else snprintf(a,sizeof(a),"L: %d%%", pct);
+    snprintf(b,sizeof(b),"F: %dMHz", m7MHz());
     drawInfoBox(gBoxBL.x, gBoxBL.y, 12, "M7", a, b);
 
-    // M4 CPU
-    fmtCpuLines(a,sizeof(a), b,sizeof(b), gM4LoadPct, gM4MHz);
+    if ((millis() - gM4LastMs) > 2000) { gM4LoadPct = -1; }
+    if (gM4LoadPct < 0) snprintf(a,sizeof(a),"L: OFF"); else snprintf(a,sizeof(a),"L: %d%%", gM4LoadPct);
+    snprintf(b,sizeof(b),"F: %dMHz", gM4MHz);
     drawInfoBox(gBoxBR.x, gBoxBR.y, 12, "M4", a, b);
 
-    drawFooterOnceThenMaintain();
+    drawMidLinkX();
+    drawFooterMaintain();
   }
 
   delay(1);
